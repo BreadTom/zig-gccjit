@@ -605,7 +605,10 @@ pub fn ArrayHashMapUnmanaged(
 
         const Self = @This();
 
-        const linear_scan_max = 8;
+        const linear_scan_max = @as(comptime_int, @max(1, @as(comptime_int, @min(
+            std.atomic.cache_line / @as(comptime_int, @max(1, @sizeOf(Hash))),
+            std.atomic.cache_line / @as(comptime_int, @max(1, @sizeOf(K))),
+        ))));
 
         const RemovalType = enum {
             swap,
@@ -1335,16 +1338,33 @@ pub fn ArrayHashMapUnmanaged(
                     hash.* = h;
                 }
             }
-            // Rebuild the index.
-            if (self.entries.capacity > linear_scan_max) {
-                // We're going to rebuild the index header and replace the existing one (if any). The
-                // indexes should sized such that they will be at most 60% full.
-                const bit_index = try IndexHeader.findBitIndex(self.entries.capacity);
-                const new_header = try IndexHeader.alloc(gpa, bit_index);
-                if (self.index_header) |header| header.free(gpa);
-                self.insertAllEntriesIntoNewHeader(if (store_hash) {} else ctx, new_header);
-                self.index_header = new_header;
-            }
+            try rebuildIndex(self, gpa, ctx);
+        }
+
+        /// Modify an entry's key without reordering any entries.
+        pub fn setKey(self: *Self, gpa: Allocator, index: usize, new_key: K) Oom!void {
+            if (@sizeOf(ByIndexContext) != 0)
+                @compileError("Cannot infer context " ++ @typeName(Context) ++ ", call setKeyContext instead.");
+            return setKeyContext(self, gpa, index, new_key, undefined);
+        }
+
+        pub fn setKeyContext(self: *Self, gpa: Allocator, index: usize, new_key: K, ctx: Context) Oom!void {
+            const key_ptr = &self.entries.items(.key)[index];
+            key_ptr.* = new_key;
+            if (store_hash) self.entries.items(.hash)[index].* = checkedHash(ctx, key_ptr.*);
+            try rebuildIndex(self, gpa, undefined);
+        }
+
+        fn rebuildIndex(self: *Self, gpa: Allocator, ctx: Context) Oom!void {
+            if (self.entries.capacity <= linear_scan_max) return;
+
+            // We're going to rebuild the index header and replace the existing one (if any). The
+            // indexes should sized such that they will be at most 60% full.
+            const bit_index = try IndexHeader.findBitIndex(self.entries.capacity);
+            const new_header = try IndexHeader.alloc(gpa, bit_index);
+            if (self.index_header) |header| header.free(gpa);
+            self.insertAllEntriesIntoNewHeader(if (store_hash) {} else ctx, new_header);
+            self.index_header = new_header;
         }
 
         /// Sorts the entries and then rebuilds the index.
@@ -2376,7 +2396,7 @@ test "shrink" {
     defer map.deinit();
 
     // This test is more interesting if we insert enough entries to allocate the index header.
-    const num_entries = 20;
+    const num_entries = 200;
     var i: i32 = 0;
     while (i < num_entries) : (i += 1)
         try testing.expect((try map.fetchPut(i, i * 10)) == null);
@@ -2387,7 +2407,7 @@ test "shrink" {
     // Test `shrinkRetainingCapacity`.
     map.shrinkRetainingCapacity(17);
     try testing.expect(map.count() == 17);
-    try testing.expect(map.capacity() == 20);
+    try testing.expect(map.capacity() >= num_entries);
     i = 0;
     while (i < num_entries) : (i += 1) {
         const gop = try map.getOrPut(i);
@@ -2436,7 +2456,7 @@ test "reIndex" {
     defer map.deinit();
 
     // Populate via the API.
-    const num_indexed_entries = 20;
+    const num_indexed_entries = 200;
     var i: i32 = 0;
     while (i < num_indexed_entries) : (i += 1)
         try testing.expect((try map.fetchPut(i, i * 10)) == null);
@@ -2528,6 +2548,22 @@ test "0 sized key and 0 sized value" {
 
     try testing.expectEqual(map.swapRemove(0), true);
     try testing.expectEqual(map.get(0), null);
+}
+
+test "setKey" {
+    const gpa = std.testing.allocator;
+
+    var map: AutoArrayHashMapUnmanaged(i32, i32) = .empty;
+    defer map.deinit(gpa);
+
+    try map.put(gpa, 12, 34);
+    try map.put(gpa, 56, 78);
+
+    try map.setKey(gpa, 0, 42);
+    try testing.expectEqual(2, map.count());
+    try testing.expectEqual(false, map.contains(12));
+    try testing.expectEqual(34, map.get(42));
+    try testing.expectEqual(78, map.get(56));
 }
 
 pub fn getHashPtrAddrFn(comptime K: type, comptime Context: type) (fn (Context, K) u32) {
